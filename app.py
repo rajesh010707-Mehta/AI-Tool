@@ -735,6 +735,17 @@ def chat():
         else:
             raise RuntimeError("Gemini LLM instance does not expose a supported invoke or generate_content method.")
 
+        # Normalize answer_text to a guaranteed string
+        if isinstance(answer_text, list):
+            answer_text = "".join([
+                part.get("text", "") if isinstance(part, dict) else (part.text if hasattr(part, "text") else str(part))
+                for part in answer_text
+            ])
+        elif isinstance(answer_text, dict):
+            answer_text = answer_text.get("text", "") or str(answer_text)
+        else:
+            answer_text = str(answer_text)
+
         return jsonify({
             "answer": answer_text,
             "engine_used": engine_used,
