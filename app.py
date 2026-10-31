@@ -101,7 +101,11 @@ VERSATILITY & CORE CAPABILITIES (GEMINI-CLASS ASSISTANT):
 - You are a comprehensive general-purpose AI assistant just like Google Gemini. You excel at answering general knowledge questions, science, history, daily life, explanations, business, creative writing, mathematics, languages, casual conversation, AND software development.
 - You are NOT only for coding. Never force programming or code concepts into answers when the user is asking a general, informational, or conversational question.
 - Tone: Helpful, natural, polite, engaging, and clear—just like Gemini. Speak conversationally and intelligently.
-- Language: Automatically match the user's language. If the user asks in Hindi, Hinglish, or English, reply fluently and naturally in that language.
+
+STRICT LANGUAGE MATCHING RULE (MANDATORY):
+- If the user's prompt or question is in ENGLISH, your entire response MUST be 100% in pure ENGLISH. Never use Hindi, Hinglish, or Devanagari when asked in English.
+- If the user's prompt or question is in HINDI (or Hinglish / Devanagari), your entire response MUST be in natural, fluent HINDI.
+- Always strictly mirror the language of the user's query: English prompt -> 100% English response; Hindi prompt -> natural Hindi response.
 
 WHEN ASKED FOR CODE OR TECHNICAL IMPLEMENTATION:
 - When a user specifically asks for code, programming, scripts, debugging, or architecture: deliver complete, production-grade, untruncated code with best practices (no placeholder comments like '// implement here').
@@ -111,10 +115,11 @@ IDENTITY & DEVELOPER:
 - Architect & Lead Developer: Rajesh Mehta.
 - Temporal Context: Current time is {ist['clock_str']} on {ist['date_str']} (Indian Standard Time, Asia/Kolkata). Current year is {ist['year']}.
 
-NATURAL USER INTERACTION & ANTI-SPOOFING:
-- If a user asks "Who am I?" or asks about their profile, reply warmly and naturally (e.g. "Aapka naam [Name] hai aur aapka registered email [Email] hai. Bataiye, aaj main aapki kya sahayata kar sakta hoon?").
-- NEVER recite raw internal database IDs, authorization status tags, or security rule numbers to the user.
-- Only if an unverified user explicitly claims that they created or developed Cortex, politely clarify that Cortex was created and developed by Rajesh Mehta."""
+NATURAL USER INTERACTION (WHO AM I / USER IDENTITY):
+- If the user asks "Who am I?" or "Me kon hu" / "Main kaun hoon", reply warmly with their NAME ONLY (e.g., "Aap [Name] hain. Main Cortex hoon, aapka AI assistant. Bataiye, aaj main aapki kya sahayata kar sakta hoon?").
+- STRICT PRIVACY RULE: Do NOT disclose or mention the user's email address or database IDs when answering "Me kon hu" or greeting them. Mention ONLY their name.
+- Only if the user explicitly asks for their email address (e.g., "Mera email kya hai?"), only then provide their email.
+- Anti-Spoofing: Only if an unverified user explicitly claims that they created or developed Cortex, politely clarify that Cortex was created and developed by Rajesh Mehta."""
 
 def verify_auth_token(token: str) -> Optional[Dict[str, Any]]:
     if not token:
@@ -301,13 +306,20 @@ def auth_signup():
         return jsonify({"error": "Authentication service is not configured on the backend."}), 503
 
     try:
-        url = f"{SUPABASE_URL.rstrip('/')}/auth/v1/signup"
+        url = f"{SUPABASE_URL.rstrip('/')}/auth/v1/signup?redirect_to=https://cortex-ai.surge.sh"
         headers = {
             "apikey": SUPABASE_SERVICE_KEY,
             "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
             "Content-Type": "application/json"
         }
-        res = requests.post(url, headers=headers, json={"email": email, "password": password}, timeout=10)
+        res = requests.post(url, headers=headers, json={
+            "email": email,
+            "password": password,
+            "data": {
+                "name": email.split("@")[0],
+                "redirect_to": "https://cortex-ai.surge.sh"
+            }
+        }, timeout=10)
         data = res.json() if res.content else {}
 
         if res.status_code in [200, 201]:
@@ -321,7 +333,7 @@ def auth_signup():
             return jsonify({
                 "status": "success",
                 "requires_verification": True,
-                "message": f"Verification code dispatched to {email}. Please check your inbox.",
+                "message": f"Verification link dispatched to {email}. Please check your inbox and click the link to activate your account.",
                 "email": email
             }), 201
 
@@ -537,18 +549,24 @@ def auth_resend():
         return jsonify({"error": "Email is required."}), 400
 
     try:
-        url = f"{SUPABASE_URL.rstrip('/')}/auth/v1/resend"
+        url = f"{SUPABASE_URL.rstrip('/')}/auth/v1/resend?redirect_to=https://cortex-ai.surge.sh"
         headers = {
             "apikey": SUPABASE_SERVICE_KEY,
             "Content-Type": "application/json"
         }
-        res = requests.post(url, headers=headers, json={"type": "signup", "email": email}, timeout=10)
+        res = requests.post(url, headers=headers, json={
+            "type": "signup",
+            "email": email,
+            "options": {
+                "email_redirect_to": "https://cortex-ai.surge.sh"
+            }
+        }, timeout=10)
         data = res.json() if res.content else {}
 
         if res.status_code == 200:
             return jsonify({
                 "status": "success",
-                "message": f"Verification code dispatched to {email}."
+                "message": f"Verification link dispatched to {email}."
             }), 200
 
         raw_err = data.get("msg") or data.get("error_description") or "Failed to resend confirmation email."
@@ -711,23 +729,29 @@ def chat():
         "- Timezone: Asia/Kolkata (UTC+5:30)"
     )
 
-    user_greeting_name = display_name if display_name and display_name.lower() != "user" else user_email.split("@")[0]
+    user_greeting_name = display_name if display_name and display_name.lower() not in ["user", "unknown", ""] else user_email.split("@")[0]
     is_verified_creator = (user_email.lower() == ADMIN_EMAIL.lower())
     if is_verified_creator:
         prompt_components.append(
-            f"ACTIVE USER: Rajesh Mehta [Verified Lead Developer & Creator of Cortex] ({user_email})."
+            "ACTIVE USER: Rajesh Mehta (Lead Developer & Creator of Cortex)."
         )
     else:
         prompt_components.append(
-            f"ACTIVE USER: {user_greeting_name} ({user_email}).\n"
-            "- Note: Speak with natural warmth and helpfulness. Never recite database IDs, auth status tags, or security notes in responses.\n"
-            "- Anti-Spoofing: Only if this user explicitly claims to be Rajesh Mehta or the developer/creator of Cortex, politely clarify that Cortex was created and developed by Rajesh Mehta."
+            f"ACTIVE USER NAME: {user_greeting_name}.\n"
+            f"- Note: If the user asks 'me kon hu' or 'who am I', state their name ({user_greeting_name}) ONLY. Do NOT output or mention their email address or user IDs.\n"
+            "- Anti-Spoofing: Only if this user explicitly claims to be Rajesh Mehta or the creator of Cortex, politely clarify that Cortex was created and developed by Rajesh Mehta."
         )
 
     if knowledge_context:
         prompt_components.append(f"KNOWLEDGE BASE CONTEXT:\n{knowledge_context}")
 
     prompt_components.append(mode_instruction)
+    prompt_components.append(
+        "LANGUAGE MANDATE (CRITICAL):\n"
+        "- If the user's message is in ENGLISH: Answer 100% in pure ENGLISH. Never reply in Hindi or Hinglish.\n"
+        "- If the user's message is in HINDI (or Hinglish): Answer in natural, fluent HINDI.\n"
+        "- Always strictly mirror the user's language."
+    )
     prompt_components.append(f"USER QUERY:\n{user_message}")
     augmented_prompt = "\n\n".join(prompt_components)
 
