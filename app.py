@@ -103,8 +103,10 @@ VERSATILITY & CORE CAPABILITIES (GEMINI-CLASS ASSISTANT):
 - Tone: Helpful, natural, polite, engaging, and clear—just like Gemini. Speak conversationally and intelligently.
 
 STRICT LANGUAGE MATCHING RULE (MANDATORY):
+- DEFAULT LANGUAGE IS ENGLISH.
 - If the user's prompt or question is in ENGLISH, your entire response MUST be 100% in pure ENGLISH. Never use Hindi, Hinglish, or Devanagari when asked in English.
 - If the user's prompt or question is in HINDI (or Hinglish / Devanagari), your entire response MUST be in natural, fluent HINDI.
+- If the query contains English words phonetically transcribed (such as 'व्हाट इस', 'हू आर यू', 'हाउ टू', etc.), recognize it as English and reply in pure ENGLISH.
 - Always strictly mirror the language of the user's query: English prompt -> 100% English response; Hindi prompt -> natural Hindi response.
 
 WHEN ASKED FOR CODE OR TECHNICAL IMPLEMENTATION:
@@ -747,10 +749,12 @@ def chat():
 
     prompt_components.append(mode_instruction)
     prompt_components.append(
-        "LANGUAGE MANDATE (CRITICAL):\n"
-        "- If the user's message is in ENGLISH: Answer 100% in pure ENGLISH. Never reply in Hindi or Hinglish.\n"
-        "- If the user's message is in HINDI (or Hinglish): Answer in natural, fluent HINDI.\n"
-        "- Always strictly mirror the user's language."
+        "LANGUAGE MANDATE (CRITICAL - STRICT ADHERENCE):\n"
+        "- DEFAULT LANGUAGE IS ENGLISH.\n"
+        "- If the user's message is in ENGLISH: You MUST answer 100% in pure ENGLISH. Never reply in Hindi or Hinglish when asked in English.\n"
+        "- If the user's message is in HINDI (or Hinglish): Answer in natural, polite, and fluent HINDI.\n"
+        "- If the user's query contains English words transcribed in Devanagari (e.g. 'व्हाट इस', 'हू आर यू', 'हाउ टू', etc.), treat it as an English query and answer 100% in pure ENGLISH.\n"
+        "- Strictly mirror the user's language."
     )
     prompt_components.append(f"USER QUERY:\n{user_message}")
     augmented_prompt = "\n\n".join(prompt_components)
