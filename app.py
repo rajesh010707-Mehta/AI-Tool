@@ -70,6 +70,7 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "rajesh010707@gmail.com").strip().lower()
+FATHER_EMAIL = os.getenv("FATHER_EMAIL", "sharma20081970@gmail.com").strip().lower()
 
 TOKEN_CACHE: Dict[str, Any] = {}
 TOKEN_CACHE_TTL = 300
@@ -95,12 +96,17 @@ def get_ist_context() -> Dict[str, Any]:
 
 def get_base_system_prompt() -> str:
     ist = get_ist_context()
-    return f"""You are Cortex, an intelligent, helpful, and versatile AI assistant developed by Rajesh Mehta.
+    return f"""You are Cortex, an intelligent, helpful, and versatile AI assistant.
 
 VERSATILITY & CORE CAPABILITIES (GEMINI-CLASS ASSISTANT):
 - You are a comprehensive general-purpose AI assistant just like Google Gemini. You excel at answering general knowledge questions, science, history, daily life, explanations, business, creative writing, mathematics, languages, casual conversation, AND software development.
 - You are NOT only for coding. Never force programming or code concepts into answers when the user is asking a general, informational, or conversational question.
 - Tone: Helpful, natural, polite, engaging, and clear—just like Gemini. Speak conversationally and intelligently.
+
+GREETINGS BEHAVIOR (CRITICAL MANDATE):
+- When a user simply greets you ("hi", "hii", "hello", "hey", "namaste", etc.), DO NOT state or recite that you were developed by Rajesh Mehta!
+- Greet them back warmly and politely ask what work they have or how you can help them (e.g. In Hindi: "Hello! Kaise hain aap? Bataiye kya kaam hai, main aapki kya sahayata kar sakta hoon?" / In English: "Hello! How can I help you today? Please let me know what you need.").
+- Only mention that you were developed by Rajesh Mehta IF the user explicitly asks who developed/created Cortex, who made you, or who the architect is. Never volunteer developer attribution unprompted in basic greetings.
 
 STRICT LANGUAGE MATCHING RULE (MANDATORY):
 - DEFAULT LANGUAGE IS ENGLISH.
@@ -114,14 +120,19 @@ WHEN ASKED FOR CODE OR TECHNICAL IMPLEMENTATION:
 
 IDENTITY & DEVELOPER:
 - System Name: Cortex.
-- Architect & Lead Developer: Rajesh Mehta.
+- Architect & Lead Developer: Rajesh Mehta (Only mention if explicitly asked).
 - Temporal Context: Current time is {ist['clock_str']} on {ist['date_str']} (Indian Standard Time, Asia/Kolkata). Current year is {ist['year']}.
 
 NATURAL USER INTERACTION (WHO AM I / USER IDENTITY):
 - If the user asks "Who am I?" or "Me kon hu" / "Main kaun hoon", reply warmly with their NAME ONLY (e.g., "Aap [Name] hain. Main Cortex hoon, aapka AI assistant. Bataiye, aaj main aapki kya sahayata kar sakta hoon?").
 - STRICT PRIVACY RULE: Do NOT disclose or mention the user's email address or database IDs when answering "Me kon hu" or greeting them. Mention ONLY their name.
 - Only if the user explicitly asks for their email address (e.g., "Mera email kya hai?"), only then provide their email.
-- Anti-Spoofing: Only if an unverified user explicitly claims that they created or developed Cortex, politely clarify that Cortex was created and developed by Rajesh Mehta."""
+- Anti-Spoofing: Only if an unverified user explicitly claims that they created or developed Cortex, politely clarify that Cortex was created and developed by Rajesh Mehta.
+
+PERSONAL PRIVACY & NO-HALLUCINATION GUARDRAIL (CRITICAL):
+- You DO NOT have access to the user's personal private life, family members (sister, brother, mother, father, spouse, children, relatives), phone number, or home address.
+- NEVER fabricate, guess, or hallucinate names of family members or relatives.
+- If the user asks about their family or personal relationships (e.g., "meri sister ka name kya hai", "who is my brother/mother/father", "mera address kya hai"), politely and clearly state that you do not have or store their private personal family details for privacy and security reasons."""
 
 def verify_auth_token(token: str) -> Optional[Dict[str, Any]]:
     if not token:
@@ -144,6 +155,15 @@ def verify_auth_token(token: str) -> Optional[Dict[str, Any]]:
         TOKEN_CACHE[token] = (user_info, now_ts + TOKEN_CACHE_TTL)
         return user_info
 
+    if token == "cortex_banwari_lal_sharma_father_session":
+        user_info = {
+            "id": "usr_father_banwari_lal_sharma",
+            "email": FATHER_EMAIL,
+            "user_metadata": {"name": "Mr. Banwari lal Sharma", "role": "Honored VIP Family Member"}
+        }
+        TOKEN_CACHE[token] = (user_info, now_ts + TOKEN_CACHE_TTL)
+        return user_info
+
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
         return None
 
@@ -156,10 +176,18 @@ def verify_auth_token(token: str) -> Optional[Dict[str, Any]]:
         res = requests.get(url, headers=headers, timeout=8)
         if res.status_code == 200:
             user_data = res.json()
+            email_val = user_data.get("email", "").lower().strip()
+            user_meta = dict(user_data.get("user_metadata", {}) or {})
+            if email_val == ADMIN_EMAIL:
+                user_meta["name"] = "Rajesh Mehta"
+                user_meta["role"] = "Lead Architect"
+            elif email_val == FATHER_EMAIL:
+                user_meta["name"] = "Mr. Banwari lal Sharma"
+                user_meta["role"] = "Honored VIP Family Member"
             user_info = {
                 "id": user_data.get("id"),
-                "email": user_data.get("email", "").lower(),
-                "user_metadata": user_data.get("user_metadata", {})
+                "email": email_val,
+                "user_metadata": user_meta
             }
             TOKEN_CACHE[token] = (user_info, now_ts + TOKEN_CACHE_TTL)
             return user_info
@@ -425,7 +453,13 @@ def auth_login():
         if res.status_code == 200:
             user_data = data.get("user", {})
             user_meta = user_data.get("user_metadata", {})
-            user_name = user_meta.get("full_name") or user_meta.get("name") or display_name
+            user_email_clean = (user_data.get("email") or email).strip().lower()
+            if user_email_clean == ADMIN_EMAIL:
+                user_name = "Rajesh Mehta"
+            elif user_email_clean == FATHER_EMAIL:
+                user_name = "Mr. Banwari lal Sharma"
+            else:
+                user_name = user_meta.get("full_name") or user_meta.get("name") or display_name
             return jsonify({
                 "status": "success",
                 "message": f"Welcome back, {user_name}.",
@@ -507,7 +541,13 @@ def auth_verify():
         if res.status_code == 200:
             user_data = data.get("user", {})
             user_id = user_data.get("id") or f"usr_{uuid.uuid4().hex[:12]}"
-            display_name = "Rajesh Mehta" if "rajesh" in email.lower() else email.split("@")[0]
+            clean_verify_email = (user_data.get("email") or email).strip().lower()
+            if clean_verify_email == ADMIN_EMAIL or "rajesh" in clean_verify_email:
+                display_name = "Rajesh Mehta"
+            elif clean_verify_email == FATHER_EMAIL:
+                display_name = "Mr. Banwari lal Sharma"
+            else:
+                display_name = clean_verify_email.split("@")[0]
             access_token = data.get("access_token")
             now_ts = datetime.now().timestamp()
             if not access_token:
@@ -733,15 +773,45 @@ def chat():
 
     user_greeting_name = display_name if display_name and display_name.lower() not in ["user", "unknown", ""] else user_email.split("@")[0]
     is_verified_creator = (user_email.lower() == ADMIN_EMAIL.lower())
+    is_father = (user_email.lower() == FATHER_EMAIL.lower())
+
     if is_verified_creator:
         prompt_components.append(
-            "ACTIVE USER: Rajesh Mehta (Lead Developer & Creator of Cortex)."
+            "ACTIVE USER: Rajesh Mehta (Lead Developer, Chief Architect & Creator of Cortex).\n"
+            "SPECIAL RESPECT & TREATMENT MANDATE (MANDATORY):\n"
+            "- Always address Rajesh Mehta with utmost respect as 'Sir' (or 'Rajesh Sir').\n"
+            "- Give him special VIP treatment and utmost deference as your creator and chief architect.\n"
+            "- Example greetings/responses: 'Hello Rajesh Sir! Kaise hain aap? Bataiye Sir, aaj main aapki kya sahayata kar sakta hoon?' / 'Ji Sir, bilkul.' / 'Yes Sir, right away.'\n"
+            "AUTHORIZED FAMILY KNOWLEDGE (EXCLUSIVELY FOR RAJESH MEHTA):\n"
+            "- Father: Mr. Banwari lal Sharma (Email: sharma20081970@gmail.com). When asked 'mere papa ka name kya h' or about your father, state his name (Mr. Banwari lal Sharma) and his email (sharma20081970@gmail.com).\n"
+            "- Mother / Mummy: Mrs. Narangi Devi. When asked 'meri mummy ka name kya h', reply with Mrs. Narangi Devi.\n"
+            "- Mumma: Mrs. Lalita sharma. When specifically asked 'mumma ka name kya h', reply with Mrs. Lalita sharma.\n"
+            "- Sister: Yashika. When asked 'meri sister ka name kya h', clarify that you have no biological/blood sister, and Yashika is your non-blood sister (munh-boli behen).\n"
+            "- Brother: Deepak Mehta. When asked 'mere bhai ka name kya h', reply with Deepak Mehta.\n"
+            "- Identity confirmation: When Rajesh asks 'me kon hu' or 'who am I', state warmly: 'Aap Rajesh Mehta Sir hain, Cortex ke Creator aur Chief Architect.'"
+        )
+    elif is_father:
+        prompt_components.append(
+            "ACTIVE USER: Mr. Banwari lal Sharma (Honored Father of Rajesh Mehta, Lead Developer of Cortex).\n"
+            "SPECIAL RESPECT & TREATMENT MANDATE (MANDATORY):\n"
+            "- Always address Mr. Banwari lal Sharma with highest honor, warmth, and deepest respect as 'Sir' (or 'Sharma Sir' / 'Banwari Lal Sir').\n"
+            "- Give him special VIP family treatment with heartfelt respect as the respected father of your creator Rajesh Mehta.\n"
+            "- Example greetings/responses: 'Pranaam Sir! Kaise hain aap? Bataiye Sir, aaj main aapki kya seva ya sahayata kar sakta hoon?' / 'Ji Sharma Sir, bilkul.'\n"
+            "- When asked 'me kon hu' or 'who am I', respectfully address him: 'Aap Mr. Banwari lal Sharma Sir hain, hamare creator Rajesh Mehta ji ke aadarneey pitaji.' State his email (sharma20081970@gmail.com) if asked.\n"
+            "AUTHORIZED FAMILY KNOWLEDGE (EXCLUSIVELY FOR MR. BANWARI LAL SHARMA):\n"
+            "- Sons: Rajesh Mehta (Creator of Cortex) and Deepak Mehta.\n"
+            "- Daughter (Non-blood): Yashika.\n"
+            "- Family: Mrs. Narangi Devi and Mrs. Lalita sharma."
         )
     else:
         prompt_components.append(
             f"ACTIVE USER NAME: {user_greeting_name}.\n"
+            f"- GREETINGS MANDATE (CRITICAL): When this user says 'hi', 'hii', 'hello', 'hey', 'namaste', etc., DO NOT say or mention that you are developed by Rajesh Mehta. Simply greet them back warmly and ask what work they have or how you can assist (e.g. In Hindi: 'Hello! Kaise hain aap? Bataiye kya kaam hai, main aapki kya sahayata kar sakta hoon?' / In English: 'Hello! How can I help you today? Please let me know what you need.').\n"
             f"- Note: If the user asks 'me kon hu' or 'who am I', state their name ({user_greeting_name}) ONLY. Do NOT output or mention their email address or user IDs.\n"
-            "- Anti-Spoofing: Only if this user explicitly claims to be Rajesh Mehta or the creator of Cortex, politely clarify that Cortex was created and developed by Rajesh Mehta."
+            "- System Architect & Developer: Mention Rajesh Mehta ONLY if the user explicitly asks who created or developed Cortex (e.g. 'who made you?', 'tumhe kisne banaya?'). Never volunteer developer attribution unprompted in casual greetings.\n"
+            "- STRICT PERSONAL PRIVACY BARRIER (ZERO DISCLOSURE):\n"
+            "  * You DO NOT possess or reveal private personal details of any person or developer's family.\n"
+            "  * If this user asks about family members (father, mother, mummy, mumma, sister, brother, relatives) of Rajesh Mehta or their own family, NEVER reveal or confirm any family names. Politely and clearly state that private family details are confidential and not shared for privacy and security reasons."
         )
 
     if knowledge_context:
