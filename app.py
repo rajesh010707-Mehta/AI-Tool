@@ -71,6 +71,18 @@ SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "rajesh010707@gmail.com").strip().lower()
 FATHER_EMAIL = os.getenv("FATHER_EMAIL", "sharma20081970@gmail.com").strip().lower()
+FRONTEND_URL = os.getenv("FRONTEND_URL", "https://cortex-ai-app.vercel.app").strip().rstrip("/")
+
+def get_frontend_redirect_url() -> str:
+    origin = (request.headers.get("Origin") or "").strip().rstrip("/")
+    if origin and ("vercel.app" in origin or "localhost" in origin or "127.0.0.1" in origin):
+        return origin
+    referer = (request.headers.get("Referer") or "").strip().rstrip("/")
+    if referer:
+        for prefix in ["https://cortex-ai-app.vercel.app", "http://localhost", "http://127.0.0.1"]:
+            if referer.startswith(prefix):
+                return prefix.rstrip("/")
+    return FRONTEND_URL
 
 TOKEN_CACHE: Dict[str, Any] = {}
 TOKEN_CACHE_TTL = 300
@@ -336,7 +348,8 @@ def auth_signup():
         return jsonify({"error": "Authentication service is not configured on the backend."}), 503
 
     try:
-        url = f"{SUPABASE_URL.rstrip('/')}/auth/v1/signup?redirect_to=https://cortex-ai.surge.sh"
+        redirect_to = get_frontend_redirect_url()
+        url = f"{SUPABASE_URL.rstrip('/')}/auth/v1/signup?redirect_to={redirect_to}"
         headers = {
             "apikey": SUPABASE_SERVICE_KEY,
             "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
@@ -347,18 +360,41 @@ def auth_signup():
             "password": password,
             "data": {
                 "name": email.split("@")[0],
-                "redirect_to": "https://cortex-ai.surge.sh"
+                "redirect_to": redirect_to
             }
         }, timeout=10)
         data = res.json() if res.content else {}
 
         if res.status_code in [200, 201]:
             identities = data.get("identities", [])
+            # Supabase returns empty identities when user already exists
             if data.get("user") is None or (isinstance(identities, list) and len(identities) == 0):
+                logger.info(f"[auth] signup attempted for existing email {email}; testing unconfirmed vs confirmed via resend")
+                resend_url = f"{SUPABASE_URL.rstrip('/')}/auth/v1/resend?redirect_to={redirect_to}"
+                resend_res = requests.post(
+                    resend_url,
+                    headers={"apikey": SUPABASE_SERVICE_KEY, "Content-Type": "application/json"},
+                    json={"type": "signup", "email": email, "options": {"email_redirect_to": redirect_to}},
+                    timeout=10
+                )
+                resend_data = resend_res.json() if resend_res.content else {}
+                resend_msg = (resend_data.get("msg") or resend_data.get("error_description") or "").lower()
+
+                # If Supabase indicates the user is already confirmed:
+                if "already confirmed" in resend_msg or resend_res.status_code == 422:
+                    return jsonify({
+                        "error": "An account with this email already exists and is verified. Please sign in instead.",
+                        "code": "email_exists",
+                        "is_confirmed": True
+                    }), 409
+
+                # Otherwise user was unconfirmed: fresh link sent! Seamlessly transition to verify screen
                 return jsonify({
-                    "error": "An account with this email already exists. Please sign in instead.",
-                    "code": "email_exists"
-                }), 409
+                    "status": "success",
+                    "requires_verification": True,
+                    "message": f"An account with this email was registered but unverified. We have resent a fresh verification link to {email}. Please check your inbox (and Spam folder).",
+                    "email": email
+                }), 200
 
             return jsonify({
                 "status": "success",
@@ -480,7 +516,7 @@ def auth_login():
                 "error": "Email not verified",
                 "code": "email_not_confirmed",
                 "requires_verification": True,
-                "message": f"Account {email} is unverified. Please enter the 6-digit confirmation code from your email.",
+                "message": f"Account {email} is unverified. Please click the verification link sent to your email to activate your account.",
                 "email": email
             }), 403
 
@@ -591,7 +627,8 @@ def auth_resend():
         return jsonify({"error": "Email is required."}), 400
 
     try:
-        url = f"{SUPABASE_URL.rstrip('/')}/auth/v1/resend?redirect_to=https://cortex-ai.surge.sh"
+        redirect_to = get_frontend_redirect_url()
+        url = f"{SUPABASE_URL.rstrip('/')}/auth/v1/resend?redirect_to={redirect_to}"
         headers = {
             "apikey": SUPABASE_SERVICE_KEY,
             "Content-Type": "application/json"
@@ -600,7 +637,7 @@ def auth_resend():
             "type": "signup",
             "email": email,
             "options": {
-                "email_redirect_to": "https://cortex-ai.surge.sh"
+                "email_redirect_to": redirect_to
             }
         }, timeout=10)
         data = res.json() if res.content else {}
