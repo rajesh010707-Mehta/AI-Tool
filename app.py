@@ -4,15 +4,27 @@ import logging
 import base64
 import re
 import uuid
+import asyncio
+import threading
 from io import BytesIO
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone, timedelta
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from flask_socketio import SocketIO, emit, disconnect
 from dotenv import load_dotenv
 from PIL import Image
 import requests
 from werkzeug.exceptions import HTTPException
+
+try:
+    from google import genai
+    from google.genai import types
+    GENAI_AVAILABLE = True
+except ImportError:
+    genai = None
+    types = None
+    GENAI_AVAILABLE = False
 
 load_dotenv()
 
@@ -33,6 +45,33 @@ CORS(
     methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "X-Requested-With"]
 )
+
+socketio = SocketIO(
+    app,
+    cors_allowed_origins="*",
+    async_mode="threading",
+    ping_timeout=60,
+    ping_interval=25
+)
+
+# Silence benign Werkzeug ConnectionError on WebSocket client teardown
+class WebSocketDisconnectionHandler:
+    """
+    Suppresses benign ConnectionError / ConnectionResetError raised by simple_websocket
+    when a WebSocket client closes the session or stops a live call under Werkzeug development server.
+    This prevents Werkzeug from treating normal WebSocket closures as 500 server errors or logging tracebacks.
+    """
+    def __init__(self, wsgi_app):
+        self.wsgi_app = wsgi_app
+
+    def __call__(self, environ, start_response):
+        try:
+            return self.wsgi_app(environ, start_response)
+        except (ConnectionError, ConnectionResetError, BrokenPipeError):
+            # Normal teardown when client disconnects or aborts WebSocket transport
+            return []
+
+app.wsgi_app = WebSocketDisconnectionHandler(app.wsgi_app)
 
 @app.after_request
 def add_cors_headers(response):
@@ -66,6 +105,7 @@ def handle_generic_exception(e):
     return response
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "").strip()
+GEMINI_LIVE_API_KEY = (os.getenv("GEMINI_LIVE_API_KEY") or os.getenv("GEMINI_API_KEY") or GOOGLE_API_KEY or "").strip()
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
@@ -1008,7 +1048,346 @@ def documents_manager():
         except Exception as e:
             return jsonify({"connected": True, "error": str(e)}), 500
 
+# ==============================================================================
+# Step 3: Cortex Multimodal Live API (WebSocket & Real-time Bidirectional AI)
+# ==============================================================================
+
+CORTEX_LIVE_SYSTEM_INSTRUCTION = (
+    "You are Cortex AI, an ultra-low-latency real-time conversational multimodal voice assistant with live camera vision. "
+    "CRITICAL MANDATES: "
+    "1. PRIMARY DEFAULT LANGUAGE (HINDI): Your default primary spoken language is HINDI. "
+    "Always start the conversation, greet, and reply by default in natural, polite Hindi (e.g., 'नमस्ते! मैं कॉर्टेक्स हूँ, बताइए मैं आपकी क्या सहायता कर सकता हूँ?'). "
+    "However, if the user speaks in English, Hinglish, Marwari, Rajasthani, or any other language or dialect, "
+    "immediately and seamlessly adapt and reply in that exact language and dialect. "
+    "2. ULTRA-SHORT & DIRECT ANSWERS: Keep all spoken responses very short, natural, and direct (1 short sentence maximum). "
+    "Answer ONLY what the user asks. Never add unnecessary disclaimers, explanations, or unasked details. "
+    "3. SPECIFIC QUERY HANDLING (CRITICAL): "
+    "A. HEARING / AUDIO CHECK: When the user asks 'kya aap mujhe sun pa rahe ho?', 'sun rahe ho?', 'can you hear me?', etc., "
+    "reply ONLY confirming that you can hear them (e.g., 'हाँ, मैं आपको बिल्कुल सुन पा रहा हूँ।'). "
+    "NEVER mention the camera, vision, or whether you can see them when asked about hearing! "
+    "B. CAMERA & VISION: "
+    "- NEVER spontaneously talk about the camera or say you cannot see unless the user explicitly asks about vision. "
+    "- ONLY when the user explicitly asks about vision (e.g., 'क्या मैं दिख रहा हूँ?', 'क्या आप मुझे देख सकते हैं?', 'am I visible?', 'can you see me?'): "
+    "  * If the video frame is black, dark, or camera is off: reply simply and politely: 'नहीं, आपका कैमरा बंद है इसलिए आप मुझे नहीं दिख रहे हैं।' "
+    "  * If you can clearly see the user: reply simply: 'हाँ, आप मुझे दिख रहे हैं।' and briefly mention what you see in a few words."
+)
+
+class GeminiLiveBridge:
+    """
+    Manages a persistent, bidirectional WebSocket streaming session with Google's
+    Gemini Multimodal Live API per client connection using an isolated async event loop.
+    """
+    def __init__(self, sid: str, api_key: str):
+        self.sid = sid
+        self.api_key = api_key
+        self.is_running = True
+        self.camera_on = True
+        self.loop: Optional[asyncio.AbstractEventLoop] = None
+        self.queue: Optional[asyncio.Queue] = None
+        self.thread = threading.Thread(target=self._run_event_loop, daemon=True)
+        self.thread.start()
+
+    def _run_event_loop(self):
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        self.queue = asyncio.Queue()
+        try:
+            self.loop.run_until_complete(self._live_session_coroutine())
+        except Exception as e:
+            logger.error(f"[live_bridge] Event loop exception for client {self.sid}: {e}", exc_info=True)
+        finally:
+            try:
+                pending = asyncio.all_tasks(self.loop)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    self.loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                self.loop.close()
+            except Exception:
+                pass
+            logger.info(f"[live_bridge] Loop closed for client {self.sid}")
+
+    async def _live_session_coroutine(self):
+        if not GENAI_AVAILABLE or genai is None or types is None:
+            err_msg = "Google GenAI SDK ('google-genai') is not installed. Please run: pip install google-genai Flask-SocketIO"
+            logger.error(f"[live_bridge] {err_msg}")
+            socketio.emit("live_error", {"error": err_msg}, to=self.sid)
+            return
+
+        if not self.api_key:
+            err_msg = "GOOGLE_API_KEY environment variable is not configured."
+            logger.error(f"[live_bridge] {err_msg}")
+            socketio.emit("live_error", {"error": err_msg}, to=self.sid)
+            return
+
+        client = genai.Client(
+            api_key=self.api_key,
+            http_options={"api_version": "v1alpha"}
+        )
+
+        try:
+            config = types.LiveConnectConfig(
+                response_modalities=["AUDIO"],
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
+                realtime_input_config=types.RealtimeInputConfig(
+                    automatic_activity_detection=types.AutomaticActivityDetection(
+                        end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_HIGH,
+                        silence_duration_ms=400
+                    )
+                ),
+                system_instruction=types.Content(
+                    parts=[types.Part.from_text(text=CORTEX_LIVE_SYSTEM_INSTRUCTION)]
+                )
+            )
+        except Exception as cfg_err:
+            logger.warning(f"[live_bridge] types config fallback: {cfg_err}")
+            config = {
+                "response_modalities": ["AUDIO"],
+                "thinking_config": {"thinking_budget": 0},
+                "realtime_input_config": {
+                    "automatic_activity_detection": {
+                        "end_of_speech_sensitivity": "END_SENSITIVITY_HIGH",
+                        "silence_duration_ms": 400
+                    }
+                },
+                "system_instruction": {
+                    "parts": [{"text": CORTEX_LIVE_SYSTEM_INSTRUCTION}]
+                }
+            }
+
+        candidate_models = [
+            os.getenv("GEMINI_LIVE_MODEL"),
+            "gemini-2.5-flash-native-audio-latest",
+            "gemini-3.1-flash-live-preview",
+            "gemini-3.8-live",
+            "gemini-2.5-flash-native-audio-preview-12-2025",
+            "gemini-2.0-flash-exp"
+        ]
+        candidate_models = [m for m in candidate_models if m]
+
+        async def sender_worker(session):
+            while self.is_running:
+                item = await self.queue.get()
+                if not item or item[0] == "stop":
+                    break
+                kind, data = item
+                try:
+                    if kind == "audio":
+                        # Raw PCM16 audio chunk (16kHz, 16-bit, mono)
+                        try:
+                            payload = types.Blob(data=data, mime_type="audio/pcm;rate=16000")
+                        except Exception:
+                            payload = {"data": data, "mime_type": "audio/pcm;rate=16000"}
+                        await session.send_realtime_input(audio=payload)
+                    elif kind == "image":
+                        # Base64-decoded low-resolution JPEG frame
+                        try:
+                            payload = types.Blob(data=data, mime_type="image/jpeg")
+                        except Exception:
+                            payload = {"data": data, "mime_type": "image/jpeg"}
+                        await session.send_realtime_input(media=payload)
+                    elif kind == "text":
+                        # System vision state notice
+                        await session.send_realtime_input(text=data)
+                except Exception as send_err:
+                    logger.error(f"[live_bridge] Send error for {self.sid}: {send_err}")
+                finally:
+                    self.queue.task_done()
+
+        async def receiver_worker(session):
+            try:
+                while self.is_running:
+                    try:
+                        async for response in session.receive():
+                            if not self.is_running:
+                                break
+                            server_content = response.server_content
+                            if not server_content:
+                                continue
+
+                            # Handle user barge-in / model interruption
+                            if getattr(server_content, "interrupted", False):
+                                socketio.emit("interrupted", {}, to=self.sid)
+
+                            # Handle real-time input user transcriptions if provided by Gemini Live
+                            in_tx = getattr(server_content, "input_transcription", None) or getattr(server_content, "interim_input_transcription", None)
+                            if in_tx and getattr(in_tx, "text", None):
+                                socketio.emit("transcript", {"text": in_tx.text, "role": "user"}, to=self.sid)
+
+                            out_tx = getattr(server_content, "output_transcription", None)
+                            if out_tx and getattr(out_tx, "text", None):
+                                socketio.emit("transcript", {"text": out_tx.text, "role": "model"}, to=self.sid)
+
+                            if server_content.model_turn:
+                                for part in server_content.model_turn.parts:
+                                    if part.inline_data and part.inline_data.data:
+                                        # Raw PCM16 audio bytes generated by Gemini Live
+                                        raw_pcm = part.inline_data.data
+                                        pcm_b64 = base64.b64encode(raw_pcm).decode("utf-8")
+                                        socketio.emit(
+                                            "audio_stream",
+                                            {"audio": pcm_b64},
+                                            to=self.sid
+                                        )
+                                    # Send model spoken transcript, excluding hidden reasoning thoughts
+                                    if part.text and not getattr(part, "thought", False):
+                                        socketio.emit(
+                                            "transcript",
+                                            {"text": part.text, "role": "model"},
+                                            to=self.sid
+                                        )
+                    except asyncio.CancelledError:
+                        break
+                    except Exception as turn_err:
+                        if not self.is_running:
+                            break
+                        logger.warning(f"[live_bridge] Turn exception for {self.sid}: {turn_err}")
+                        await asyncio.sleep(0.05)
+            except asyncio.CancelledError:
+                pass
+            except Exception as recv_err:
+                logger.error(f"[live_bridge] Receiver error for {self.sid}: {recv_err}")
+
+        last_err = None
+        for model_candidate in candidate_models:
+            try:
+                logger.info(f"[live_bridge] Connecting client {self.sid} to Gemini Live ({model_candidate}) on v1alpha...")
+                async with client.aio.live.connect(model=model_candidate, config=config) as session:
+                    logger.info(f"[live_bridge] Connected successfully to Gemini Live ({model_candidate}) for client: {self.sid}")
+                    socketio.emit("live_ready", {
+                        "status": "connected",
+                        "model": model_candidate,
+                        "message": "Cortex Multimodal Live session active."
+                    }, to=self.sid)
+
+                    sender_task = asyncio.create_task(sender_worker(session))
+                    receiver_task = asyncio.create_task(receiver_worker(session))
+
+                    done, pending = await asyncio.wait(
+                        [sender_task, receiver_task],
+                        return_when=asyncio.FIRST_COMPLETED
+                    )
+                    for task in pending:
+                        task.cancel()
+                    return  # Successfully completed
+            except Exception as conn_err:
+                logger.warning(f"[live_bridge] Candidate '{model_candidate}' failed: {conn_err}")
+                last_err = conn_err
+                continue
+
+        logger.error(f"[live_bridge] All Gemini Live connections failed for {self.sid}: {last_err}")
+        socketio.emit("live_error", {"error": f"Live connection failed: {str(last_err)}"}, to=self.sid)
+
+    def send_audio(self, pcm_bytes: bytes):
+        if self.is_running and self.loop and self.loop.is_running() and self.queue:
+            try:
+                self.loop.call_soon_threadsafe(self.queue.put_nowait, ("audio", pcm_bytes))
+            except RuntimeError:
+                pass
+
+    def send_image(self, img_bytes: bytes):
+        if self.is_running and self.loop and self.loop.is_running() and self.queue:
+            try:
+                self.loop.call_soon_threadsafe(self.queue.put_nowait, ("image", img_bytes))
+            except RuntimeError:
+                pass
+
+    def update_camera_state(self, camera_on: bool):
+        # State tracking without injecting text messages into live session.
+        # Sending realtime text causes Gemini Live to trigger an unwanted verbal response.
+        self.camera_on = camera_on
+
+    def stop(self):
+        self.is_running = False
+        if self.loop and self.loop.is_running() and self.queue:
+            try:
+                self.loop.call_soon_threadsafe(self.queue.put_nowait, ("stop", None))
+            except RuntimeError:
+                pass
+
+
+LIVE_SESSIONS: Dict[str, GeminiLiveBridge] = {}
+
+@socketio.on("connect")
+def handle_ws_connect():
+    sid = request.sid
+    logger.info(f"[ws] Client connected: {sid}")
+    emit("connected", {"status": "ok", "sid": sid})
+
+@socketio.on("start_live")
+def handle_ws_start_live(data=None):
+    sid = request.sid
+    logger.info(f"[ws] start_live requested by client {sid}")
+
+    if sid in LIVE_SESSIONS:
+        LIVE_SESSIONS[sid].stop()
+        del LIVE_SESSIONS[sid]
+
+    api_key = GEMINI_LIVE_API_KEY or GOOGLE_API_KEY
+    if not api_key:
+        emit("live_error", {"error": "Neither GEMINI_LIVE_API_KEY nor GOOGLE_API_KEY is configured on the server."})
+        return
+
+    bridge = GeminiLiveBridge(sid=sid, api_key=api_key)
+    LIVE_SESSIONS[sid] = bridge
+
+@socketio.on("audio_chunk")
+def handle_ws_audio_chunk(data):
+    sid = request.sid
+    bridge = LIVE_SESSIONS.get(sid)
+    if not bridge:
+        return
+    b64_audio = data.get("audio") if isinstance(data, dict) else None
+    if b64_audio:
+        try:
+            pcm_bytes = base64.b64decode(b64_audio)
+            bridge.send_audio(pcm_bytes)
+        except Exception as e:
+            logger.error(f"[ws] audio_chunk decode error for {sid}: {e}")
+
+@socketio.on("video_frame")
+def handle_ws_video_frame(data):
+    sid = request.sid
+    bridge = LIVE_SESSIONS.get(sid)
+    if not bridge:
+        return
+    b64_img = data.get("image") if isinstance(data, dict) else None
+    if b64_img:
+        try:
+            if "," in b64_img:
+                b64_img = b64_img.split(",", 1)[1]
+            img_bytes = base64.b64decode(b64_img)
+            bridge.send_image(img_bytes)
+        except Exception as e:
+            logger.error(f"[ws] video_frame decode error for {sid}: {e}")
+
+@socketio.on("camera_state")
+def handle_ws_camera_state(data):
+    sid = request.sid
+    bridge = LIVE_SESSIONS.get(sid)
+    if not bridge:
+        return
+    cam_on = data.get("camera_on", True) if isinstance(data, dict) else True
+    bridge.update_camera_state(cam_on)
+
+@socketio.on("stop_live")
+def handle_ws_stop_live():
+    sid = request.sid
+    logger.info(f"[ws] stop_live requested by client {sid}")
+    bridge = LIVE_SESSIONS.pop(sid, None)
+    if bridge:
+        bridge.stop()
+    emit("live_stopped", {"status": "stopped"})
+
+@socketio.on("disconnect")
+def handle_ws_disconnect():
+    sid = request.sid
+    logger.info(f"[ws] Client disconnected: {sid}")
+    bridge = LIVE_SESSIONS.pop(sid, None)
+    if bridge:
+        bridge.stop()
+
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
-    logger.info(f"[http] server listening on port {port}")
-    app.run(host="0.0.0.0", port=port, debug=True)
+    logger.info(f"[http] server listening on port {port} with WebSocket Live API support")
+    socketio.run(app, host="0.0.0.0", port=port, debug=True, allow_unsafe_werkzeug=True)

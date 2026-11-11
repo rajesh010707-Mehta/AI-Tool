@@ -12,3 +12,6 @@ psycopg2-binary>=2.9.9
 sqlalchemy>=2.0.0
 pgvector>=0.3.0
 supabase>=2.5.0
+Flask-SocketIO>=5.3.6
+google-genai>=0.1.1
+simple-websocket>=1.0.0
