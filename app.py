@@ -36,11 +36,32 @@ logging.basicConfig(
 logger = logging.getLogger("cortex_api")
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16MB maximum payload cap
 
-cors_origins = os.getenv("CORS_ORIGIN", "*")
+DEFAULT_ALLOWED_ORIGINS = [
+    "https://cortex-ai-app.vercel.app",
+    "http://localhost:5000",
+    "http://127.0.0.1:5000",
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:5500",
+    "http://127.0.0.1:5500"
+]
+
+env_cors = os.getenv("CORS_ORIGIN", "").strip()
+if env_cors:
+    if env_cors == "*":
+        allowed_origins = ["*"]
+    else:
+        allowed_origins = [o.strip() for o in env_cors.split(",") if o.strip()]
+else:
+    allowed_origins = DEFAULT_ALLOWED_ORIGINS
+
 CORS(
     app,
-    resources={r"/*": {"origins": cors_origins if cors_origins == "*" else cors_origins.split(",")}},
+    resources={r"/*": {"origins": allowed_origins if "*" not in allowed_origins else "*"}},
     supports_credentials=True,
     methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "X-Requested-With"]
@@ -48,7 +69,7 @@ CORS(
 
 socketio = SocketIO(
     app,
-    cors_allowed_origins="*",
+    cors_allowed_origins="*" if "*" in allowed_origins else allowed_origins,
     async_mode="threading",
     ping_timeout=60,
     ping_interval=25
@@ -77,10 +98,11 @@ app.wsgi_app = WebSocketDisconnectionHandler(app.wsgi_app)
 def add_cors_headers(response):
     origin = request.headers.get("Origin")
     if origin:
-        response.headers["Access-Control-Allow-Origin"] = origin
-        response.headers["Access-Control-Allow-Credentials"] = "true"
-        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With"
-        response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        if "*" in allowed_origins or origin in allowed_origins:
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Access-Control-Allow-Credentials"] = "true"
+            response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With"
+            response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     return response
 
 @app.errorhandler(HTTPException)
@@ -198,23 +220,25 @@ def verify_auth_token(token: str) -> Optional[Dict[str, Any]]:
             return cached_user
         TOKEN_CACHE.pop(token, None)
 
-    if token == "cortex_rajesh_mehta_lead_architect_session":
-        user_info = {
-            "id": "usr_lead_architect_rajesh_mehta",
-            "email": ADMIN_EMAIL,
-            "user_metadata": {"name": "Rajesh Mehta", "role": "Lead Architect"}
-        }
-        TOKEN_CACHE[token] = (user_info, now_ts + TOKEN_CACHE_TTL)
-        return user_info
+    dev_bypass_enabled = os.getenv("ALLOW_DEV_BYPASS", "").lower() == "true"
+    if dev_bypass_enabled:
+        if token == "cortex_rajesh_mehta_lead_architect_session":
+            user_info = {
+                "id": "usr_lead_architect_rajesh_mehta",
+                "email": ADMIN_EMAIL,
+                "user_metadata": {"name": "Rajesh Mehta", "role": "Lead Architect"}
+            }
+            TOKEN_CACHE[token] = (user_info, now_ts + TOKEN_CACHE_TTL)
+            return user_info
 
-    if token == "cortex_banwari_lal_sharma_father_session":
-        user_info = {
-            "id": "usr_father_banwari_lal_sharma",
-            "email": FATHER_EMAIL,
-            "user_metadata": {"name": "Mr. Banwari lal Sharma", "role": "Honored VIP Family Member"}
-        }
-        TOKEN_CACHE[token] = (user_info, now_ts + TOKEN_CACHE_TTL)
-        return user_info
+        if token == "cortex_banwari_lal_sharma_father_session":
+            user_info = {
+                "id": "usr_father_banwari_lal_sharma",
+                "email": FATHER_EMAIL,
+                "user_metadata": {"name": "Mr. Banwari lal Sharma", "role": "Honored VIP Family Member"}
+            }
+            TOKEN_CACHE[token] = (user_info, now_ts + TOKEN_CACHE_TTL)
+            return user_info
 
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
         return None
@@ -349,6 +373,8 @@ def index():
                 "login": "POST /api/auth/login",
                 "verify": "POST /api/auth/verify",
                 "resend": "POST /api/auth/resend",
+                "recover": "POST /api/auth/recover",
+                "update_password": "POST /api/auth/update-password",
                 "me": "GET /api/auth/me"
             },
             "documents": "GET/POST /api/documents"
@@ -363,7 +389,7 @@ def health_check():
         "supabase_ready": vector_store is not None,
         "auth_ready": bool(SUPABASE_URL and SUPABASE_SERVICE_KEY),
         "database_ready": bool(DATABASE_URL),
-        "cors_origin": cors_origins
+        "cors_origin": allowed_origins
     }), 200
 
 @app.route("/api/auth/signup", methods=["POST", "OPTIONS"])
@@ -732,6 +758,99 @@ def auth_me():
         return jsonify({"error": "Session token invalid or expired."}), 401
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+@app.route("/api/auth/recover", methods=["POST", "OPTIONS"])
+def auth_recover():
+    if request.method == "OPTIONS":
+        return "", 204
+
+    payload = request.get_json(silent=True) or {}
+    email = payload.get("email", "").strip().lower()
+
+    if not email:
+        return jsonify({"error": "Email address is required."}), 400
+
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        return jsonify({"error": "Authentication service is not configured on the backend."}), 503
+
+    try:
+        redirect_to = get_frontend_redirect_url()
+        url = f"{SUPABASE_URL.rstrip('/')}/auth/v1/recover"
+        headers = {
+            "apikey": SUPABASE_SERVICE_KEY,
+            "Content-Type": "application/json"
+        }
+        res = requests.post(url, headers=headers, json={
+            "email": email,
+            "options": {
+                "email_redirect_to": redirect_to
+            }
+        }, timeout=10)
+        data = res.json() if res.content else {}
+
+        if res.status_code in [200, 204]:
+            return jsonify({
+                "status": "success",
+                "message": f"Password reset instructions have been sent to {email}. Please check your inbox (and Spam folder)."
+            }), 200
+
+        raw_err = data.get("msg") or data.get("error_description") or "Failed to send reset email."
+        if "rate limit" in raw_err.lower() or res.status_code == 429:
+            return jsonify({
+                "error": "Password reset rate limit reached. Please wait a few minutes before trying again.",
+                "code": "rate_limit_exceeded"
+            }), 429
+
+        return jsonify({"error": raw_err, "details": data}), res.status_code
+
+    except Exception as e:
+        logger.error(f"[auth] recover exception: {e}", exc_info=True)
+        return jsonify({"error": f"Password reset error: {str(e)}"}), 500
+
+@app.route("/api/auth/update-password", methods=["POST", "OPTIONS"])
+def auth_update_password():
+    if request.method == "OPTIONS":
+        return "", 204
+
+    payload = request.get_json(silent=True) or {}
+    new_password = payload.get("password", "").strip()
+    token = payload.get("token", "").strip()
+
+    auth_header = request.headers.get("Authorization", "")
+    if not token and auth_header.startswith("Bearer "):
+        token = auth_header.split(" ", 1)[1].strip()
+
+    if not token:
+        return jsonify({"error": "Authentication token is required to update password."}), 401
+
+    if not new_password or len(new_password) < 6:
+        return jsonify({"error": "Password must be at least 6 characters long."}), 400
+
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        return jsonify({"error": "Authentication service is not configured on the backend."}), 503
+
+    try:
+        url = f"{SUPABASE_URL.rstrip('/')}/auth/v1/user"
+        headers = {
+            "apikey": SUPABASE_SERVICE_KEY,
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
+        res = requests.put(url, headers=headers, json={"password": new_password}, timeout=10)
+        data = res.json() if res.content else {}
+
+        if res.status_code == 200:
+            return jsonify({
+                "status": "success",
+                "message": "Password updated successfully. You can now sign in with your new password."
+            }), 200
+
+        raw_err = data.get("msg") or data.get("error_description") or "Failed to update password."
+        return jsonify({"error": raw_err, "details": data}), res.status_code
+
+    except Exception as e:
+        logger.error(f"[auth] update-password exception: {e}", exc_info=True)
+        return jsonify({"error": f"Password update error: {str(e)}"}), 500
 
 @app.route("/api/chat", methods=["POST", "OPTIONS"])
 def chat():
@@ -1304,6 +1423,31 @@ def handle_ws_connect():
 def handle_ws_start_live(data=None):
     sid = request.sid
     logger.info(f"[ws] start_live requested by client {sid}")
+
+    token = None
+    if isinstance(data, dict):
+        token = data.get("token") or data.get("access_token")
+    if not token and hasattr(request, "auth") and isinstance(request.auth, dict):
+        token = request.auth.get("token") or request.auth.get("access_token")
+    if not token and hasattr(request, "headers"):
+        auth_hdr = request.headers.get("Authorization", "")
+        if auth_hdr.lower().startswith("bearer "):
+            token = auth_hdr[7:].strip()
+    if not token and hasattr(request, "args"):
+        token = request.args.get("token") or request.args.get("access_token")
+
+    auth_user = verify_auth_token(token) if token else None
+    if not auth_user:
+        logger.warning(f"[ws] Unauthorized start_live rejected for client {sid}")
+        emit("live_error", {
+            "error": "Authentication required. Please sign in to access Cortex Live.",
+            "status": 401,
+            "requires_auth": True
+        })
+        return
+
+    user_email = auth_user.get("email", "unknown")
+    logger.info(f"[ws] start_live authenticated for user {user_email} (sid {sid})")
 
     if sid in LIVE_SESSIONS:
         LIVE_SESSIONS[sid].stop()
